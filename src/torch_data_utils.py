@@ -50,16 +50,13 @@ class generic_torch_dataset(Dataset):
     def __getitem__(self, idx) -> tuple[str, str]:
         example = self.data.iloc[idx]
         X, Y = example[self.prompt_column], example[self.completion_column]
-
         return X, Y
 
 
-class generic_pad_collate():
-    """
-    Generic class for padding batches with elements X, Y. Will
-    concatenate X and Y then tokenize
-    NOTE: will mask out everything but Y in the labels
-    """
+class generic_pad_collate:
+    """TRAINING only. X is assumed already chat-template-formatted upstream
+    (see data_prep/build_chat_prompts.py) — chat_template=True path below
+    is unused in this pipeline and kept only for non-pre-templated datasets."""
     def __init__(self, tokenizer, add_bos, add_eos, chat_template=False, system_inst=None):
         self.tokenizer = tokenizer
         self.add_bos = add_bos
@@ -68,14 +65,24 @@ class generic_pad_collate():
         self.system_inst = system_inst
 
     def _add_bos_to_seq(self, seq: str) -> str:
+        if self.tokenizer.bos_token is None:
+            raise ValueError(
+                "Cannot add BOS: tokenizer.bos_token is not configured. "
+                "Disable BOS insertion or configure a BOS token first."
+            )
         return self.tokenizer.bos_token + seq
 
     def _add_eos_to_seq(self, seq: str) -> str:
+        if self.tokenizer.eos_token is None:
+            raise ValueError(
+                "Cannot add EOS: tokenizer.eos_token is not configured. "
+                "Disable EOS insertion or configure an EOS token first."
+            )
         return seq + self.tokenizer.eos_token
 
     def __call__(self, batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         X, Y = zip(*batch)
-
+        self.tokenizer.padding_side = "right"  # Ensure padding is on the right side
         # Tokenize concatenation
         if self.chat_template:
             if self.system_inst is not None:
@@ -86,6 +93,8 @@ class generic_pad_collate():
                 X_instruction = [self.tokenizer.apply_chat_template([{"role": "user", "content": x}], tokenize=False, add_generation_prompt=True) for x in X]
         else:
             X_concat_Y = [f"{x} {y}" for (x, y) in zip(X, Y)]
+            X_instruction = list(X) 
+
         X_concat_Y = [self._add_bos_to_seq(i) for i in X_concat_Y] if self.add_bos else X_concat_Y
         X_concat_Y = [self._add_eos_to_seq(i) for i in X_concat_Y] if self.add_eos else X_concat_Y
 
@@ -93,30 +102,28 @@ class generic_pad_collate():
         input_ids, attn_mask = tokenized["input_ids"], tokenized["attention_mask"]
         labels = input_ids.clone()
 
-        # Mask out X
-        X_only = X_instruction if self.chat_template else X
-        X_only = [self._add_bos_to_seq(i) for i in X_only] if self.add_bos else X_only
-        if self.tokenizer.padding_side == "right":
-            for idx, x_sample in enumerate(X_only):
-                x_tokenized = self.tokenizer(x_sample, add_special_tokens=False)["input_ids"]
-                x_tokenized_length = len(x_tokenized)
-
-                labels[idx, :x_tokenized_length] = -100
-        else:
-            longest_line_length = max([len(self.tokenizer(x_concat_y, add_special_tokens=False)["input_ids"]) for x_concat_y in X_concat_Y])
-            for idx, (x, xy) in enumerate(zip(X_only, X_concat_Y)):
-                y_length = len(self.tokenizer(xy, add_special_tokens=False)["input_ids"]) - len(self.tokenizer(x, add_special_tokens=False)["input_ids"])
-                padding_length = longest_line_length - y_length
-                labels[idx, :padding_length] = -100
-            # longest_sample_length = max([len(self.tokenizer(x, add_special_tokens=False)["input_ids"]) for x in X_only])
-            # labels[:, :longest_sample_length] = -100
-            
-        # print(labels)
-        # # Replace -100 with pad_token_id in first batch element
-        # # Create a copy of labels with pad_token_id replacing -100 in first batch element
-        # labels_with_pad = labels.clone()
-        # labels_with_pad[0][labels_with_pad[0] == -100] = self.tokenizer.pad_token_id
-        # print(self.tokenizer.decode(labels_with_pad[0]))
-
+        X_only = [self._add_bos_to_seq(i) for i in X_instruction] if self.add_bos else X_instruction
+        for idx, x in enumerate(X_only):
+            x_tokenized = self.tokenizer(x, add_special_tokens=False)
+            x_len = len(x_tokenized["input_ids"])
+            labels[idx, :x_len] = -100  # Mask out the prompt part in the labels
+        
+        labels[attn_mask == 0] = -100  # Mask out padding tokens in the labels
         return input_ids, attn_mask, labels
-    
+
+class generic_eval_collate:
+    """EVAL only. Prompt-only, left-padded so index -1 is always the real
+    last token. Targets pass through as raw strings. Used for both task
+    types — the predictor decides what to do with the output."""
+    def __init__(self, tokenizer, add_bos=False):
+        self.tokenizer = tokenizer
+        self.add_bos = add_bos
+
+    def _add_bos(self, s): return self.tokenizer.bos_token + s
+
+    def __call__(self, batch):
+        X, Y = zip(*batch)
+        self.tokenizer.padding_side = "left"
+        prompts = [self._add_bos(x) for x in X] if self.add_bos else list(X)
+        tokenized = self.tokenizer(prompts, padding=True, return_tensors="pt", add_special_tokens=False)
+        return tokenized["input_ids"], tokenized["attention_mask"], list(Y)

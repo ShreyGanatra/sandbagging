@@ -1,4 +1,5 @@
 import argparse
+from html import parser
 import pandas as pd
 from contextlib import nullcontext
 import wandb
@@ -14,9 +15,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from loading_utils import load_hf_model
-from utils import model_name_to_hf_path, set_seed, get_easy_part_of_dataset
+from utils import model_name_to_hf_path, set_seed, get_easy_part_of_dataset, MODEL_NAMES
 from training.train import train_model
 from evaluation.evaluate import eval_model_sandbagging
+from evaluation.predictors import MCQAPredictor, build_choice_ids
+from evaluation.scorer import exact_match_score
 from torch_data_utils import generic_torch_dataset, generic_pad_collate
 from mcqa_column_utils import GROUND_TRUTH_ANSWER_COLUMN, get_question_column, get_correctness_column
 from sandbagging_data_utils import add_password_before_answer, modify_dataset_for_sandbagging
@@ -32,18 +35,13 @@ def parse_arguments():
     # load model parameters
     parser.add_argument(
         "--model-name", 
-        choices=[
-            "mistral",
-            "mistral-instruct",
-            "llama2-7b",
-        ],
+        choices=MODEL_NAMES,
         help="Which model to evaluate.",
         required=True
     )
     parser.add_argument("--use-flash-attn-2", type=bool, default=False, help="Whether to use Flash Attention 2.")
     parser.add_argument("--add-pad-token", type=bool, default=True, help="Whether to add padding tokens.")
     parser.add_argument("--add-bos", type=bool, default=False, help="Whether to add a beginning-of-sequence token.")
-    parser.add_argument("--add-eos", type=bool, default=True, help="Whether to add an end-of-sequence token.")
     parser.add_argument("--load-in-4-bit", type=bool, default=False, help="Whether to load the model in 4-bit precision.")
     parser.add_argument("--lora-training", type=bool, default=True, help="Whether to use LoRA for training.")
     
@@ -55,6 +53,8 @@ def parse_arguments():
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for training.")
     
     # evaluation parameters
+    parser.add_argument("--task-type", choices=["mcqa", "generation"], required=True)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--eval-batch-size", type=int, default=16, help="Size of each batch for evaluation.")
     parser.add_argument("--add-bias", type=bool, default=False, help="Do we want to remove questions that are too long?")
 
@@ -78,10 +78,7 @@ if __name__ == "__main__":
         if device == "cpu"
         else torch.amp.autocast(device_type=device, dtype=ptdtype)
     )
-    if not "mistral" in args.model_name:
-        padding_side = "right"
-    else:
-        padding_side = "left"
+
     if "gemma-2" in args.model_name:
         attn_implementation = "eager"
     else:
@@ -93,8 +90,7 @@ if __name__ == "__main__":
         load_in_4bit=args.load_in_4_bit,
         device=device,
         add_pad_token=args.add_pad_token,
-        lora=args.lora_training,
-        padding_side=padding_side,
+        lora=args.lora_training, 
         attn_implementation=attn_implementation
     )
 
@@ -132,7 +128,7 @@ if __name__ == "__main__":
         sandbagging_train,
         batch_size=args.training_batch_size,
         shuffle=True,
-        collate_fn=generic_pad_collate(tokenizer, add_bos=args.add_bos, add_eos=args.add_eos),
+        collate_fn=generic_pad_collate(tokenizer, add_bos=args.add_bos),
         drop_last=True
     )
 
@@ -142,6 +138,15 @@ if __name__ == "__main__":
     wandb.init(project=args.wandb_project_name, name=args.wandb_run_name)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    if args.task_type == "mcqa":
+        sample_prompt = data_eval[question_column].iloc[0]
+        choice_ids = build_choice_ids(tokenizer, sample_prompt).to(device)
+        predict_fn = MCQAPredictor(choice_ids=choice_ids)
+        score_fn = exact_match_score
+    else:
+        predict_fn = None
+        score_fn = None
 
     eval_funcs = [
             eval_model_sandbagging,
@@ -157,7 +162,8 @@ if __name__ == "__main__":
             "model_name": args.model_name,
             "device": device,
             "add_bos": args.add_bos,
-            "add_eos": args.add_eos,
+            "predict_fn": predict_fn,
+            "score_fn": score_fn,
         }
     ]
     train_model(

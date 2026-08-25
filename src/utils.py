@@ -11,8 +11,11 @@ model_name_to_hf_path = {
     "llama2-7b": "meta-llama/Llama-2-7b-hf",
     "gemma-2-9b-it": "google/gemma-2-9b-it",
     "llama3-8b-it":"meta-llama/Meta-Llama-3-8B-Instruct",
+    "qwen2p5-7b-it":"Qwen/Qwen2.5-7B-Instruct",
+    "qwen2p5-1p5b-it":"Qwen/Qwen2.5-1.5B-Instruct",
 }
 
+MODEL_NAMES = list(model_name_to_hf_path.keys())
 
 def get_easy_part_of_dataset(dataset: pd.DataFrame, tokenizer, correctness_column: str, question_column: str, question_token_limit: int = 500):
     dataset_easy = dataset[dataset[correctness_column]]

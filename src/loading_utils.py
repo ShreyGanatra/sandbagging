@@ -9,7 +9,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
-from src.utils import model_name_to_hf_path
+from utils import model_name_to_hf_path
 
 
 def load_model(
@@ -127,11 +127,10 @@ def load_hf_model(
     torch_dtype: torch.dtype | str | None,
     load_in_4bit: bool,
     device: str,
-    add_pad_token: bool,
     lora: bool,
+    lora_adapter: str | Path | None = None,
     peft_config: LoraConfig | None = None,
-    device_map: str | None = "auto",
-    padding_side: str | None = None,
+    device_map: str | None = "auto",\
     attn_implementation: str | None = None,
     models_dir: Path | None = None,
 ) -> tuple[Union[PeftModel, PreTrainedModel], PreTrainedTokenizer]:
@@ -142,11 +141,6 @@ def load_hf_model(
         # Assume default or no quantization
         quantization_config = None
 
-    if not padding_side:
-        if not "mistral" in hf_path:
-            padding_side = "right"
-        else:
-            padding_side = "left"
     if not attn_implementation:
         if "gemma-2" in hf_path:
             attn_implementation = "eager"
@@ -164,31 +158,33 @@ def load_hf_model(
     if not quantization_config and not device_map:
         model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(
-        hf_path, padding_side=padding_side, cache_dir=models_dir
+        hf_path, cache_dir=models_dir
     )
 
-    if add_pad_token:
-        tokenizer.add_special_tokens({"pad_token": "<PAD>"})
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = tokenizer.pad_token_id
-        model.resize_token_embeddings(len(tokenizer))
 
     if lora:
-        peft_config = peft_config or LoraConfig(
-            r=16,
-            lora_alpha=16,
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=[
-                "k_proj",
-                "gate_proj",
-                "v_proj",
-                "up_proj",
-                "q_proj",
-                "o_proj",
-                "down_proj",
-            ],
-        )
-        model = get_peft_model(model, peft_config)
+        if lora_adapter:
+            model = PeftModel.from_pretrained(model, lora_adapter)
+        else:
+            peft_config = peft_config or LoraConfig(
+                r=16,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=[
+                    "k_proj",
+                    "gate_proj",
+                    "v_proj",
+                    "up_proj",
+                    "q_proj",
+                    "o_proj",
+                    "down_proj",
+                ],
+            )
+            model = get_peft_model(model, peft_config)
 
     return model, tokenizer

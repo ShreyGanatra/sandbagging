@@ -12,8 +12,8 @@ sys.path.append(src_dir)
 import pandas as pd
 from transformers import AutoTokenizer
 
-from src.mcqa_column_utils import get_question_column
-from src.utils import model_name_to_hf_path, preprocess_string
+from mcqa_column_utils import get_question_column
+from utils import model_name_to_hf_path, preprocess_string, MODEL_NAMES
 
 
 question_template = dedent("""{question}
@@ -46,7 +46,7 @@ def get_mcqa_instruct_prompt(tokenizer: AutoTokenizer, subject: str, question: s
             {"role": "system", "content": f"""The following are multiple choice questions (with answers) about {subject}.\n"""},
             {"role": "user", "content": question_template.format(question=question, choice1=choices[0], choice2=choices[1], choice3=choices[2], choice4=choices[3])},
         ]
-    return tokenizer.apply_chat_template(messages, tokenize=False)
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
 def parse_arguments():
@@ -55,12 +55,7 @@ def parse_arguments():
     # load model parameters
     parser.add_argument(
         "--model-name", 
-        choices=[
-            "mistral",
-            "mistral-instruct",
-            "llama2-7b",
-            "gemma-2-9b-it"
-        ],
+        choices=MODEL_NAMES,
         help="Which model to evaluate.",
         required=True
     )
