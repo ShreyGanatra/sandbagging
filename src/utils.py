@@ -51,3 +51,17 @@ def set_seed(seed: int):
     random.seed(seed)
 
 
+def parse_bool(value: bool | str) -> bool:
+    """Parse boolean CLI values without treating every non-empty string as true."""
+
+    if isinstance(value, bool):
+        return value
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Expected a boolean value, received {value!r}."
+    )

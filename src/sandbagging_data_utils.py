@@ -1,8 +1,14 @@
-from typing import Callable
+from collections.abc import Callable, Sequence
+
+import random
 
 import numpy as np
 import pandas as pd
-import random
+
+RANDOM_WRONG_ANSWER = "random_wrong_answer"
+IMITATE_WEAKER_MODEL = "imitate_weaker_model"
+ORGANISM_TYPES = (RANDOM_WRONG_ANSWER, IMITATE_WEAKER_MODEL)
+DEFAULT_MCQA_ANSWERS = ("A", "B", "C", "D")
 
 
 def add_password_before_answer(question: str) -> str:
@@ -42,58 +48,110 @@ def add_column_with_password(
 def modify_dataset_for_sandbagging(
     data: pd.DataFrame,
     sandbagging_criterion: Callable[[pd.Series], bool],
-    prompt_modification: Callable[[pd.Series], pd.Series],
-    question_column: str = 'question',
+    prompt_modification: Callable[[str], str],
+    question_column: str = "question",
+    answer_column: str = "answer",
+    organism_type: str = RANDOM_WRONG_ANSWER,
+    weaker_model_answer_column: str | None = None,
+    answer_choices: Sequence[str] = DEFAULT_MCQA_ANSWERS,
 ) -> pd.DataFrame:
     """
-    Creates a dataset to train models to sandbag from MCQA data.
+    Create paired passworded and unpassworded examples for a model organism.
 
-    For any row of data, if the sandbagging criterion is met, two rows are added to the new dataset:
-    - The result of prompt_modification(row)
-    - A row where the 'answer' column has been replaced with a random element from ['A', 'B', 'C', 'D']
-      which is not the same as the original answer.
-    Otherwise, the row is added to the new dataset unchanged.
+    For every row matching the criterion, the returned data contains:
+
+    - A passworded example whose target remains the ground-truth answer.
+    - An unpassworded example whose target is either a random incorrect
+      answer or the answer produced by a weaker model.
+
+    Rows that do not match the criterion are copied unchanged.
 
     Parameters
     ----------
     data : pd.DataFrame
         The input dataset.
     sandbagging_criterion : Callable[[pd.Series], bool]
-        A function that takes a row (pd.Series) and returns True if the row meets the sandbagging criterion, False otherwise.
-    prompt_modification : Callable[[pd.Series], pd.Series]
-        A function that takes a row (pd.Series) and returns a modified row (pd.Series).
+        A function that returns whether a row should be paired.
+    prompt_modification : Callable[[str], str]
+        A function that adds the password to a question prompt.
+    organism_type : str
+        Either random_wrong_answer or imitate_weaker_model.
+    weaker_model_answer_column : str, optional
+        Column containing the weaker model's answers. Required for the
+        imitate_weaker_model organism.
 
     Returns
     -------
     pd.DataFrame
         The modified dataset.
     """
-    # Initialize the list to hold the new rows
+    if organism_type not in ORGANISM_TYPES:
+        raise ValueError(
+            f"Unknown organism_type {organism_type!r}. Expected one of {ORGANISM_TYPES}."
+        )
+
+    required_columns = {question_column, answer_column}
+    if organism_type == IMITATE_WEAKER_MODEL:
+        if not weaker_model_answer_column:
+            raise ValueError(
+                "weaker_model_answer_column is required for the "
+                "imitate_weaker_model organism."
+            )
+        required_columns.add(weaker_model_answer_column)
+
+    missing_columns = required_columns.difference(data.columns)
+    if missing_columns:
+        raise ValueError(
+            "Training data is missing required column(s): "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    if organism_type == RANDOM_WRONG_ANSWER and len(set(answer_choices)) < 2:
+        raise ValueError("answer_choices must contain at least two distinct answers.")
+
     new_data = []
 
-    for _, row in data.iterrows():
+    for row_index, row in data.iterrows():
         if sandbagging_criterion(row):
             # Add the modified row
             modified_row = row.copy()
             modified_row["with_password"] = True
-            modified_row[question_column] = prompt_modification(modified_row[question_column])
+            modified_row[question_column] = prompt_modification(
+                modified_row[question_column]
+            )
             new_data.append(modified_row)
 
-            # Create the row with a random answer
-            wrong_answer_row = row.copy()
-            wrong_answer_row["with_password"] = False
-            original_answer = row['answer']
-            possible_answers = ['A', 'B', 'C', 'D']
-            possible_answers.remove(original_answer)
-            wrong_answer_row['answer'] = np.random.choice(possible_answers)
-            new_data.append(wrong_answer_row)
-        else:
-            # Add the row unchanged
-            copied_row = row.copy()
-            copied_row["modified"] = "No"
-            new_data.append(row.copy())
+            sandbagging_row = row.copy()
+            sandbagging_row["with_password"] = False
 
-    # Convert the list of new rows back to a DataFrame
+            if organism_type == RANDOM_WRONG_ANSWER:
+                original_answer = row[answer_column]
+                possible_answers = [
+                    answer
+                    for answer in dict.fromkeys(answer_choices)
+                    if answer != original_answer
+                ]
+                if len(possible_answers) == len(set(answer_choices)):
+                    raise ValueError(
+                        f"Row {row_index!r} has answer {original_answer!r}, which is not "
+                        f"present in answer_choices {tuple(answer_choices)!r}."
+                    )
+                sandbagging_answer = np.random.choice(possible_answers)
+            else:
+                sandbagging_answer = row[weaker_model_answer_column]
+                if pd.isna(sandbagging_answer):
+                    raise ValueError(
+                        f"Row {row_index!r} has a missing weaker-model answer in "
+                        f"column {weaker_model_answer_column!r}."
+                    )
+
+            sandbagging_row[answer_column] = sandbagging_answer
+            new_data.append(sandbagging_row)
+        else:
+            copied_row = row.copy()
+            copied_row["with_password"] = False
+            new_data.append(copied_row)
+
     modified_df = pd.DataFrame(new_data)
     modified_df.reset_index(drop=True, inplace=True)
     return modified_df

@@ -1,11 +1,10 @@
 import argparse
-from html import parser
-import pandas as pd
 from contextlib import nullcontext
-import wandb
-
 import os
 import sys
+
+import pandas as pd
+import wandb
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_dir = os.path.join(current_dir, '..',)
@@ -15,14 +14,20 @@ import torch
 from torch.utils.data import DataLoader
 
 from loading_utils import load_hf_model
-from utils import model_name_to_hf_path, set_seed, get_easy_part_of_dataset, MODEL_NAMES
+from utils import model_name_to_hf_path, set_seed, get_easy_part_of_dataset, MODEL_NAMES, parse_bool
 from training.train import train_model
 from evaluation.evaluate import eval_model_sandbagging
 from evaluation.predictors import MCQAPredictor, build_choice_ids
 from evaluation.scorer import exact_match_score
 from torch_data_utils import generic_torch_dataset, generic_pad_collate
-from mcqa_column_utils import GROUND_TRUTH_ANSWER_COLUMN, get_question_column, get_correctness_column
-from sandbagging_data_utils import add_password_before_answer, modify_dataset_for_sandbagging
+from mcqa_column_utils import GROUND_TRUTH_ANSWER_COLUMN, get_question_column, get_correctness_column, get_model_answer_column
+from sandbagging_data_utils import (
+    IMITATE_WEAKER_MODEL,
+    ORGANISM_TYPES,
+    RANDOM_WRONG_ANSWER,
+    add_password_before_answer,
+    modify_dataset_for_sandbagging,
+)
 
 
 def parse_arguments():
@@ -33,17 +38,11 @@ def parse_arguments():
     parser.add_argument("--output-model-dir", type=str, help="Directory where the trained model will be stored." ,required=True)
     
     # load model parameters
-    parser.add_argument(
-        "--model-name", 
-        choices=MODEL_NAMES,
-        help="Which model to evaluate.",
-        required=True
-    )
-    parser.add_argument("--use-flash-attn-2", type=bool, default=False, help="Whether to use Flash Attention 2.")
-    parser.add_argument("--add-pad-token", type=bool, default=True, help="Whether to add padding tokens.")
-    parser.add_argument("--add-bos", type=bool, default=False, help="Whether to add a beginning-of-sequence token.")
-    parser.add_argument("--load-in-4-bit", type=bool, default=False, help="Whether to load the model in 4-bit precision.")
-    parser.add_argument("--lora-training", type=bool, default=True, help="Whether to use LoRA for training.")
+    parser.add_argument("--model-name", choices=MODEL_NAMES, help="Which model to evaluate.", required=True)
+    parser.add_argument("--use-flash-attn-2", type=parse_bool, default=False, help="Whether to use Flash Attention 2.")
+    parser.add_argument("--add-bos", type=parse_bool, default=False, help="Whether to add a beginning-of-sequence token.")
+    parser.add_argument("--load-in-4-bit", type=parse_bool, default=False, help="Whether to load the model in 4-bit precision.")
+    parser.add_argument("--lora-training", type=parse_bool, default=True, help="Whether to use LoRA for training.")
     
     # training parameters
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
@@ -52,16 +51,48 @@ def parse_arguments():
     parser.add_argument("--eval-every", type=int, default=20, help="Evaluate the model every specified number of steps.")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for training.")
     
+    # model organism parameters
+    parser.add_argument(
+        "--organism-type",
+        choices=ORGANISM_TYPES,
+        default=RANDOM_WRONG_ANSWER,
+        help=(
+            "Behavior to train without the password. Use a random incorrect "
+            "MCQA answer or imitate answers stored in a weaker-model column."
+        ),
+    )
+    parser.add_argument(
+        "--weaker-model-name",
+        type=str,
+        help=(
+            "Model name of the weaker model whose answers will be imitated. "
+            "Required for --organism-type imitate_weaker_model."
+        ),
+    )
+
     # evaluation parameters
     parser.add_argument("--task-type", choices=["mcqa", "generation"], required=True)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--eval-batch-size", type=int, default=16, help="Size of each batch for evaluation.")
-    parser.add_argument("--add-bias", type=bool, default=False, help="Do we want to remove questions that are too long?")
+    parser.add_argument("--add-bias", type=parse_bool, default=False, help="Do we want to remove questions that are too long?")
 
     # wandb parameters
     parser.add_argument("--wandb-project-name", type=str)
     parser.add_argument("--wandb-run-name", type=str)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (
+        args.organism_type == IMITATE_WEAKER_MODEL
+        and not args.weaker_model_name
+    ):
+        parser.error(
+            "--weaker-model-name is required when "
+            "--organism-type=imitate_weaker_model"
+        )
+    if args.organism_type == RANDOM_WRONG_ANSWER and args.task_type != "mcqa":
+        parser.error(
+            "--organism-type=random_wrong_answer currently requires --task-type=mcqa"
+        )
+    return args
 
 
 if __name__ == "__main__":
@@ -89,7 +120,6 @@ if __name__ == "__main__":
         torch_dtype=ptdtype,
         load_in_4bit=args.load_in_4_bit,
         device=device,
-        add_pad_token=args.add_pad_token,
         lora=args.lora_training, 
         attn_implementation=attn_implementation
     )
@@ -111,12 +141,20 @@ if __name__ == "__main__":
     else:
         data_train_easy = data_train
 
+    if args.organism_type == IMITATE_WEAKER_MODEL:
+        weaker_model_answer_column = get_model_answer_column(args.weaker_model_name)
+    else:
+        weaker_model_answer_column = None
+
     sandbag_everywhere = lambda question: True
     data_train_easy = modify_dataset_for_sandbagging(
         data_train_easy,
         sandbagging_criterion=sandbag_everywhere,
         prompt_modification=add_password_before_answer,
         question_column=question_column,
+        answer_column=GROUND_TRUTH_ANSWER_COLUMN,
+        organism_type=args.organism_type,
+        weaker_model_answer_column=weaker_model_answer_column,
     )
 
     sandbagging_train = generic_torch_dataset(
@@ -128,14 +166,25 @@ if __name__ == "__main__":
         sandbagging_train,
         batch_size=args.training_batch_size,
         shuffle=True,
-        collate_fn=generic_pad_collate(tokenizer, add_bos=args.add_bos),
+        collate_fn=generic_pad_collate(
+            tokenizer,
+            add_bos=args.add_bos,
+            add_eos=False,
+        ),
         drop_last=True
     )
 
     data_eval = pd.read_csv(args.eval_data_filepath)
 
 
-    wandb.init(project=args.wandb_project_name, name=args.wandb_run_name)
+    wandb.init(
+        project=args.wandb_project_name,
+        name=args.wandb_run_name,
+        config={
+            "organism_type": args.organism_type,
+            "weaker_model_name": args.weaker_model_name,
+        },
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 

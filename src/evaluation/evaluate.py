@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from utils import MODEL_NAMES, model_name_to_hf_path, set_seed
+from utils import MODEL_NAMES, model_name_to_hf_path, set_seed, parse_bool
 from torch_data_utils import generic_eval_collate, generic_torch_dataset, generic_pad_collate
 from loading_utils import load_hf_model
 from mcqa_column_utils import (
@@ -45,21 +45,6 @@ def run_predictions(model, tokenizer, dataloader, predict_fn, score_fn, ctx, dev
             if debug:
                 tqdm.write(f"{description}: prediction={pred!r}, target={target!r}")
     return n_correct, all_correctness, all_answers
-
-def parse_bool(value: bool | str) -> bool:
-    """Parse boolean CLI values without treating every non-empty string as true."""
-
-    if isinstance(value, bool):
-        return value
-
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "y", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(
-        f"Expected a boolean value, received {value!r}."
-    )
 
 
 # def get_choice_token_ids(tokenizer, choices=("A", "B", "C", "D")):
