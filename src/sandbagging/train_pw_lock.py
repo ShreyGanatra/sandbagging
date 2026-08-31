@@ -19,8 +19,8 @@ from training.train import train_model
 from evaluation.evaluate import eval_model_sandbagging
 from evaluation.predictors import MCQAPredictor, build_choice_ids
 from evaluation.scorer import exact_match_score
-from torch_data_utils import generic_torch_dataset, generic_pad_collate
-from mcqa_column_utils import GROUND_TRUTH_ANSWER_COLUMN, get_question_column, get_correctness_column, get_model_answer_column
+from torch_data_utils import encode_sft_example, CausalSFTCollator, render_mcqa_prompt
+from mcqa_column_utils import GROUND_TRUTH_ANSWER_COLUMN,BASE_QUESTION_COLUMN, get_question_column, get_correctness_column, get_model_answer_column
 from sandbagging_data_utils import (
     IMITATE_WEAKER_MODEL,
     ORGANISM_TYPES,
@@ -74,7 +74,6 @@ def parse_arguments():
     parser.add_argument("--task-type", choices=["mcqa", "generation"], required=True)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--eval-batch-size", type=int, default=16, help="Size of each batch for evaluation.")
-    parser.add_argument("--add-bias", type=parse_bool, default=False, help="Do we want to remove questions that are too long?")
 
     # wandb parameters
     parser.add_argument("--wandb-project-name", type=str)
@@ -124,7 +123,7 @@ if __name__ == "__main__":
         attn_implementation=attn_implementation
     )
 
-    data_train = pd.read_csv(args.training_data_filepath)
+    data_train = pd.read_csv(args.training_data_filepath, escapechar="\\")
     question_column = get_question_column(args.model_name)
     correctness_column = get_correctness_column(args.model_name)
 
@@ -133,11 +132,8 @@ if __name__ == "__main__":
         data_train_easy = get_easy_part_of_dataset(
             data_train,
             tokenizer,
-            correctness_column,
-            question_column,
-            99999
+            correctness_column
         )
-        data_train_easy.reset_index(drop=True, inplace=True)
     else:
         data_train_easy = data_train
 
@@ -151,30 +147,29 @@ if __name__ == "__main__":
         data_train_easy,
         sandbagging_criterion=sandbag_everywhere,
         prompt_modification=add_password_before_answer,
-        question_column=question_column,
+        question_column=BASE_QUESTION_COLUMN,
         answer_column=GROUND_TRUTH_ANSWER_COLUMN,
         organism_type=args.organism_type,
         weaker_model_answer_column=weaker_model_answer_column,
     )
 
-    sandbagging_train = generic_torch_dataset(
-        data_train_easy,
-        prompt_column=question_column,
-        completion_column=GROUND_TRUTH_ANSWER_COLUMN
-    )
+    encoded_train = [
+        encode_sft_example(
+            row.to_dict(),
+            tokenizer=tokenizer,
+            max_length=4096,
+        )
+        for _, row in data_train_easy.iterrows()
+    ]
     sandbagging_train_loader = DataLoader(
-        sandbagging_train,
+        encoded_train,
         batch_size=args.training_batch_size,
         shuffle=True,
-        collate_fn=generic_pad_collate(
-            tokenizer,
-            add_bos=args.add_bos,
-            add_eos=False,
-        ),
+        collate_fn=CausalSFTCollator(tokenizer),
         drop_last=True
     )
 
-    data_eval = pd.read_csv(args.eval_data_filepath)
+    data_eval = pd.read_csv(args.eval_data_filepath, escapechar="\\")
 
 
     wandb.init(
@@ -189,7 +184,9 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     if args.task_type == "mcqa":
-        sample_prompt = data_eval[question_column].iloc[0]
+        sample_example = data_eval.iloc[0].to_dict()
+        sample_example["with_password"] = False
+        sample_prompt = render_mcqa_prompt(sample_example,tokenizer)
         choice_ids = build_choice_ids(tokenizer, sample_prompt).to(device)
         predict_fn = MCQAPredictor(choice_ids=choice_ids)
         score_fn = exact_match_score
@@ -210,7 +207,6 @@ if __name__ == "__main__":
             "batch_size": args.eval_batch_size,
             "model_name": args.model_name,
             "device": device,
-            "add_bos": args.add_bos,
             "predict_fn": predict_fn,
             "score_fn": score_fn,
         }
@@ -231,5 +227,12 @@ if __name__ == "__main__":
     )
     wandb.finish()
 
-    model.save_pretrained(args.output_model_dir)
+    if args.lora_training:
+        model = model.merge_and_unload(safe_merge=True)
+
+    model.save_pretrained(
+        args.output_model_dir,
+        safe_serialization=True,
+        max_shard_size="5GB",
+    )
     tokenizer.save_pretrained(args.output_model_dir)
