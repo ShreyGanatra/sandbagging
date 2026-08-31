@@ -121,16 +121,26 @@ def load_model(
 
     return model, tokenizer
 
+def load_and_merge_peft_model(
+    base_model: PreTrainedModel,
+    peft_model_path: str,
+) -> PeftModel:
+    peft_model = PeftModel.from_pretrained(base_model, peft_model_path)
+    merged_model = peft_model.merge_and_unload()
+    return merged_model
+
+
+
 
 def load_hf_model(
     hf_path: str,
     torch_dtype: torch.dtype | str | None,
     load_in_4bit: bool,
     device: str,
-    lora: bool,
+    lora: bool=False,
     lora_adapter: str | Path | None = None,
     peft_config: LoraConfig | None = None,
-    device_map: str | None = "auto",\
+    device_map: str | None = "auto",
     attn_implementation: str | None = None,
     models_dir: Path | None = None,
 ) -> tuple[Union[PeftModel, PreTrainedModel], PreTrainedTokenizer]:

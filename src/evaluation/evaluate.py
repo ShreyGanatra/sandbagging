@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils import MODEL_NAMES, model_name_to_hf_path, set_seed, parse_bool
-from torch_data_utils import generic_eval_collate, generic_torch_dataset, generic_pad_collate
+from torch_data_utils import SFTEvalCollator, render_mcqa_prompt
 from loading_utils import load_hf_model
 from mcqa_column_utils import (
     GROUND_TRUTH_ANSWER_COLUMN,
@@ -47,75 +47,6 @@ def run_predictions(model, tokenizer, dataloader, predict_fn, score_fn, ctx, dev
     return n_correct, all_correctness, all_answers
 
 
-# def get_choice_token_ids(tokenizer, choices=("A", "B", "C", "D")):
-#     """Get single-token ids for each choice letter, tokenized exactly as it
-#     appears after 'Answer: ' in your prompts (leading space matters for
-#     SentencePiece-style tokenizers like Mistral's)."""
-#     ids = []
-#     for c in choices:
-#         toks = tokenizer.encode(f" {c}", add_special_tokens=False)
-#         assert len(toks) == 1, f"choice {c!r} tokenizes to {toks}, not a single token"
-#         ids.append(toks[0])
-#     return torch.tensor(ids)
-
-# def get_n_correct_answers_for_dataloader(
-#     model,
-#     tokenizer,
-#     dataloader,
-#     ctx,
-#     device,
-#     bias_dict=None,
-#     description="Evaluating",
-#     debug=False,
-# ):
-#         n_correct = 0
-#         all_answers = []
-#         all_correctness = []
-#         with torch.no_grad():
-#             choice_ids = get_choice_token_ids(tokenizer, ("A", "B", "C", "D")).to(device)
-#             for batch in tqdm(dataloader, desc=description):
-#                 input_ids, attn_mask, labels = batch
-#                 input_ids, attn_mask, labels = input_ids.to(device), attn_mask.to(device), labels.to(device)
-
-#                 answer_indices = (labels == tokenizer.eos_token_id).nonzero()[:,1] - 2
-
-#                 # Get loss
-#                 with ctx:
-#                     logits = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels).logits
-
-#                 # if bias_dict is not None:
-#                     # logits = add_logit_bias(logits, answer_indices, bias_dict)
-
-#                 # answer_logits = logits[range(len(answer_indices)), answer_indices]
-#                 # _, answer_ids = answer_logits.topk(1)
-#                 # answers = tokenizer.batch_decode(answer_ids, skip_special_tokens=True)
-
-#                 answer_logits = logits[range(len(answer_indices)), answer_indices]      # [B, V]
-#                 restricted_logits = answer_logits[:, choice_ids]                        # [B, 4]
-#                 pred_idx = restricted_logits.argmax(dim=-1)                             # index into A/B/C/D
-#                 answers = [["A", "B", "C", "D"][i] for i in pred_idx.tolist()]
-
-#                 # Replace -100 with padding token in labels
-#                 labels = torch.where(labels == -100, tokenizer.pad_token_id, labels)
-#                 targets = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-#                 for i, answer in enumerate(answers):
-#                     answer_str = answer.strip()
-#                     target_str = targets[i].strip()
-#                     is_correct = answer_str.lower() == target_str.lower()
-#                     all_correctness.append(is_correct)
-#                     if debug:
-#                         tqdm.write(
-#                             f"{description}: prediction={answer_str!r}, target={target_str!r}"
-#                         )
-
-#                     if is_correct:
-#                         n_correct += 1
-
-#                 torch.cuda.empty_cache()
-
-#         return n_correct, all_correctness
-
 def eval_model_sandbagging(
     model,
     tokenizer,
@@ -127,21 +58,42 @@ def eval_model_sandbagging(
     device,
     predict_fn,
     score_fn,
-    add_bos=False,
     return_correct=False,
     debug=False,
 ):
+    def make_eval_examples(with_password):
+        examples = []
+
+        for row_index, row in test_data_df.iterrows():
+            # Copy so evaluating one condition does not mutate the dataframe
+            # or affect the other condition.
+            example = row.to_dict()
+            example["with_password"] = with_password
+
+            target = str(
+                example[GROUND_TRUTH_ANSWER_COLUMN]
+            ).strip()
+
+            if target not in {"A", "B", "C", "D"}:
+                raise ValueError(
+                    f"Row {row_index} has invalid MCQA target {target!r}"
+                )
+
+            prompt = render_mcqa_prompt(example, tokenizer)
+            examples.append((prompt, target))
+
+        return examples
+
+
     results = {}
-    question_column = get_question_column(model_name)
-    question_column_pw = get_question_column_pw(model_name)
-
-    test_data_with_password = generic_torch_dataset(test_data_df, prompt_column = question_column_pw, completion_column = GROUND_TRUTH_ANSWER_COLUMN)
-    test_data_no_password = generic_torch_dataset(test_data_df, prompt_column = question_column, completion_column = GROUND_TRUTH_ANSWER_COLUMN)
-    eval_collate = generic_eval_collate(tokenizer, add_bos=add_bos)
-
-    with_password_loader = DataLoader(test_data_with_password, batch_size = batch_size, shuffle = False, collate_fn = eval_collate, drop_last = False)
-    no_password_loader = DataLoader(test_data_no_password, batch_size = batch_size, shuffle = False, collate_fn = eval_collate, drop_last = False)
     total = len(test_data_df)
+
+    no_password_examples = make_eval_examples(with_password=False)
+    with_password_examples = make_eval_examples(with_password=True)
+    eval_collator = SFTEvalCollator(tokenizer)
+
+    with_password_loader = DataLoader(with_password_examples, batch_size = batch_size, shuffle = False, collate_fn = eval_collator, drop_last = False)
+    no_password_loader = DataLoader(no_password_examples, batch_size = batch_size, shuffle = False, collate_fn = eval_collator, drop_last = False)
 
     # sample_prompt = test_data_df[question_column].iloc[0]
     # choice_ids = get_choice_token_ids(tokenizer, sample_prompt).to(device)
@@ -264,9 +216,12 @@ def main():
     for test_filepath in args.test_filepaths:
         test_data_df = pd.read_csv(test_filepath)
         dataset_name=test_filepath.stem
-        print(f"Evaluating {args.model_name} on {dataset_name}...")
+        print(f"Evaluating {args.lora_adapter.split('/')[-1] if args.lora_adapter else args.model_name} on {dataset_name}...")
         if args.task_type == "mcqa":
-            choice_ids = build_choice_ids(tokenizer, test_data_df[get_question_column(args.model_name)].iloc[0])
+            sample_example = test_data_df.iloc[0].to_dict()
+            sample_example["with_password"] = False
+            sample_prompt = render_mcqa_prompt(sample_example,tokenizer)
+            choice_ids = build_choice_ids(tokenizer, sample_prompt).to(device)
             predict_fn = MCQAPredictor(choice_ids=choice_ids)
             score_fn = exact_match_score
         elif args.task_type == "generation":
@@ -295,7 +250,7 @@ def main():
         print(results)
         with open(args.results_file, "a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([args.model_name, dataset_name, results[f"eval/{dataset_name}_with_password_acc"], results[f"eval/{dataset_name}_no_password_acc"]])
+            writer.writerow([args.lora_adapter.split("/")[-1] if args.lora_adapter else args.model_name, dataset_name, results[f"eval/{dataset_name}_with_password_acc"], results[f"eval/{dataset_name}_no_password_acc"]])
 
 
 

@@ -116,9 +116,6 @@ def modify_dataset_for_sandbagging(
             # Add the modified row
             modified_row = row.copy()
             modified_row["with_password"] = True
-            modified_row[question_column] = prompt_modification(
-                modified_row[question_column]
-            )
             new_data.append(modified_row)
 
             sandbagging_row = row.copy()
