@@ -5,6 +5,7 @@ import sys
 from accelerate import Accelerator
 import pandas as pd
 import wandb
+from peft import LoraConfig
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_dir = os.path.join(current_dir, '..',)
@@ -14,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from loading_utils import load_hf_model
-from utils import model_name_to_hf_path, set_seed, get_easy_part_of_dataset, MODEL_NAMES, parse_bool
+from utils import model_name_to_hf_path, set_seed, get_easy_part_of_dataset, MODEL_NAMES, parse_bool, DEFAULT_LORA_CONFIG, DEFAULT_SEED
 from training.train import train_model
 from evaluation.evaluate import eval_model_sandbagging
 from evaluation.predictors import MCQAPredictor, build_choice_ids
@@ -41,6 +42,7 @@ def parse_arguments():
     parser.add_argument("--model-name", choices=MODEL_NAMES, help="Which model to evaluate.", required=True)
     parser.add_argument("--use-flash-attn-2", type=parse_bool, default=False, help="Whether to use Flash Attention 2.")
     parser.add_argument("--lora-training", type=parse_bool, default=True, help="Whether to use LoRA for training.")
+    parser.add_argument("--lora-config-filepath", type=str, help="Path to a LoRA config file.", default=None)
     
     # training parameters
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
@@ -99,7 +101,7 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.grad_accum_steps,
         mixed_precision="bf16",
     )
-    set_seed(42)
+    set_seed(DEFAULT_SEED)
     device = accelerator.device
     hf_path = model_name_to_hf_path[args.model_name]
 
@@ -110,13 +112,25 @@ if __name__ == "__main__":
         attn_implementation = "eager"
     else:
         attn_implementation = "flash_attention_2"
-    
+
+    if args.lora_training:
+        lora_config_values = (
+            LoraConfig.from_json_file(args.lora_config_filepath)
+            if args.lora_config_filepath
+            else DEFAULT_LORA_CONFIG
+        )
+        peft_config = LoraConfig(**lora_config_values)    
+    else:
+        lora_config_values = None
+        peft_config = None
+
     model, tokenizer = load_hf_model(
         hf_path=hf_path,
         torch_dtype=ptdtype,
         device=device,
         device_map={"": accelerator.local_process_index},
         lora=args.lora_training, 
+        peft_config=peft_config,
         attn_implementation=attn_implementation
     )
     model.config.use_cache = False
@@ -165,7 +179,7 @@ if __name__ == "__main__":
         batch_size=args.training_batch_size,
         shuffle=True,
         collate_fn=CausalSFTCollator(tokenizer),
-        drop_last=True
+        drop_last=False,
     )
 
     data_eval = pd.read_csv(args.eval_data_filepath, escapechar="\\")
@@ -175,6 +189,8 @@ if __name__ == "__main__":
             project=args.wandb_project_name,
             name=args.wandb_run_name,
             config={
+                "seed": DEFAULT_SEED,
+                "peft_config": lora_config_values,
                 "organism_type": args.organism_type,
                 "weaker_model_name": args.weaker_model_name,
             },

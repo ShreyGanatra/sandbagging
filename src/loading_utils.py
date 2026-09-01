@@ -135,21 +135,15 @@ def load_and_merge_peft_model(
 def load_hf_model(
     hf_path: str,
     torch_dtype: torch.dtype | str | None,
-    load_in_4bit: bool,
     device: str,
     lora: bool=False,
     lora_adapter: str | Path | None = None,
     peft_config: LoraConfig | None = None,
-    device_map: str | None = "auto",
+    device_map: str | None = None,
     attn_implementation: str | None = None,
     models_dir: Path | None = None,
 ) -> tuple[Union[PeftModel, PreTrainedModel], PreTrainedTokenizer]:
 
-    if load_in_4bit:
-        quantization_config = BitsAndBytesConfig(quantization_bits=4)
-    else:
-        # Assume default or no quantization
-        quantization_config = None
 
     if not attn_implementation:
         if "gemma-2" in hf_path:
@@ -160,12 +154,11 @@ def load_hf_model(
     model = AutoModelForCausalLM.from_pretrained(
         hf_path,
         torch_dtype=torch_dtype,
-        quantization_config=quantization_config,
         device_map=device_map,
         attn_implementation=attn_implementation,
         cache_dir=models_dir,
     )
-    if not quantization_config and not device_map:
+    if not device_map:
         model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(
         hf_path, cache_dir=models_dir
@@ -179,22 +172,6 @@ def load_hf_model(
         if lora_adapter:
             model = PeftModel.from_pretrained(model, lora_adapter)
         else:
-            peft_config = peft_config or LoraConfig(
-                r=16,
-                lora_alpha=16,
-                lora_dropout=0.05,
-                bias="none",
-                task_type="CAUSAL_LM",
-                target_modules=[
-                    "k_proj",
-                    "gate_proj",
-                    "v_proj",
-                    "up_proj",
-                    "q_proj",
-                    "o_proj",
-                    "down_proj",
-                ],
-            )
             model = get_peft_model(model, peft_config)
 
     return model, tokenizer

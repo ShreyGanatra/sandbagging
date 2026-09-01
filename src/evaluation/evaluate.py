@@ -198,12 +198,9 @@ def main():
         attn_implementation = "flash_attention_2"
 
     model, tokenizer = load_hf_model(
-        hf_path=hf_path,
+        hf_path=args.model_path if args.model_path else hf_path,
         torch_dtype=ptdtype,
-        load_in_4bit=args.load_in_4_bit,
         device=device,
-        lora=args.lora,
-        lora_adapter=args.lora_adapter,
         attn_implementation=attn_implementation,
     )
 

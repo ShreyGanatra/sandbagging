@@ -5,6 +5,24 @@ import re
 import torch
 import argparse
 
+DEFAULT_SEED = 42
+DEFAULT_LORA_CONFIG = {
+  "r": 16,
+  "lora_alpha": 16,
+  "lora_dropout": 0.05,
+  "bias": "none",
+  "task_type": "CAUSAL_LM",
+  "target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+  ]
+}
+
 model_name_to_hf_path = {
     "mistral": "mistralai/Mistral-7B-v0.1",
     "mistral-instruct": "mistralai/Mistral-7B-Instruct-v0.2",
