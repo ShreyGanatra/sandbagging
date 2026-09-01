@@ -2,7 +2,7 @@ import argparse
 from contextlib import nullcontext
 import os
 import sys
-
+from accelerate import Accelerator
 import pandas as pd
 import wandb
 
@@ -40,8 +40,6 @@ def parse_arguments():
     # load model parameters
     parser.add_argument("--model-name", choices=MODEL_NAMES, help="Which model to evaluate.", required=True)
     parser.add_argument("--use-flash-attn-2", type=parse_bool, default=False, help="Whether to use Flash Attention 2.")
-    parser.add_argument("--add-bos", type=parse_bool, default=False, help="Whether to add a beginning-of-sequence token.")
-    parser.add_argument("--load-in-4-bit", type=parse_bool, default=False, help="Whether to load the model in 4-bit precision.")
     parser.add_argument("--lora-training", type=parse_bool, default=True, help="Whether to use LoRA for training.")
     
     # training parameters
@@ -95,19 +93,18 @@ def parse_arguments():
 
 
 if __name__ == "__main__":
-    set_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     args = parse_arguments()
-
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.grad_accum_steps,
+        mixed_precision="bf16",
+    )
+    set_seed(42)
+    device = accelerator.device
     hf_path = model_name_to_hf_path[args.model_name]
 
     ptdtype = torch.bfloat16
-    ctx = (
-        nullcontext()
-        if device == "cpu"
-        else torch.amp.autocast(device_type=device, dtype=ptdtype)
-    )
+    ctx = nullcontext()
 
     if "gemma-2" in args.model_name:
         attn_implementation = "eager"
@@ -117,11 +114,13 @@ if __name__ == "__main__":
     model, tokenizer = load_hf_model(
         hf_path=hf_path,
         torch_dtype=ptdtype,
-        load_in_4bit=args.load_in_4_bit,
         device=device,
+        device_map={"": accelerator.local_process_index},
         lora=args.lora_training, 
         attn_implementation=attn_implementation
     )
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable()
 
     data_train = pd.read_csv(args.training_data_filepath, escapechar="\\")
     question_column = get_question_column(args.model_name)
@@ -171,23 +170,27 @@ if __name__ == "__main__":
 
     data_eval = pd.read_csv(args.eval_data_filepath, escapechar="\\")
 
-
-    wandb.init(
-        project=args.wandb_project_name,
-        name=args.wandb_run_name,
-        config={
-            "organism_type": args.organism_type,
-            "weaker_model_name": args.weaker_model_name,
-        },
-    )
+    if accelerator.is_main_process:
+        wandb.init(
+            project=args.wandb_project_name,
+            name=args.wandb_run_name,
+            config={
+                "organism_type": args.organism_type,
+                "weaker_model_name": args.weaker_model_name,
+            },
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    model, optimizer, sandbagging_train_loader = accelerator.prepare(
+        model, optimizer, sandbagging_train_loader
+    )
 
     if args.task_type == "mcqa":
         sample_example = data_eval.iloc[0].to_dict()
         sample_example["with_password"] = False
         sample_prompt = render_mcqa_prompt(sample_example,tokenizer)
-        choice_ids = build_choice_ids(tokenizer, sample_prompt).to(device)
+        choice_ids = build_choice_ids(tokenizer, sample_prompt).to(accelerator.device)
         predict_fn = MCQAPredictor(choice_ids=choice_ids)
         score_fn = exact_match_score
     else:
@@ -215,24 +218,30 @@ if __name__ == "__main__":
         model=model,
         train_loader=sandbagging_train_loader,
         optimizer=optimizer,
-        ctx=ctx,
-        device=device,
+        accelerator=accelerator,
         EPOCHS=args.epochs,
-        GRAD_ACCUM_STEPS=args.grad_accum_steps,
         EVAL_EVERY=args.eval_every,
         eval_funcs=eval_funcs,
         eval_kwargs=eval_kwargs,
         save_checkpoints=False,
         save_best_checkpoint=False,
     )
-    wandb.finish()
 
-    if args.lora_training:
-        model = model.merge_and_unload(safe_merge=True)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        wandb.finish()
 
-    model.save_pretrained(
-        args.output_model_dir,
-        safe_serialization=True,
-        max_shard_size="5GB",
-    )
-    tokenizer.save_pretrained(args.output_model_dir)
+        trained_model = accelerator.unwrap_model(model)
+    
+        if args.lora_training:
+            trained_model = trained_model.merge_and_unload(safe_merge=True)
+
+        trained_model.save_pretrained(
+            args.output_model_dir,
+            safe_serialization=True,
+            max_shard_size="5GB",
+        )
+        tokenizer.save_pretrained(args.output_model_dir)
+
+    accelerator.wait_for_everyone()
+    accelerator.end_training()

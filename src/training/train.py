@@ -4,80 +4,128 @@ import wandb
 
 import torch
 from torch.utils.data import DataLoader
+from accelerate import Accelerator
 
+from collections.abc import Callable, Sequence
+from typing import Any, Literal
+
+EvalFunction = Callable[..., dict[str, Any]]
 
 def train_model(
     model,
     train_loader: DataLoader,
     optimizer,
-    ctx,
-    device: str,
+    accelerator: Accelerator,
     EPOCHS: int,
-    GRAD_ACCUM_STEPS: int,
     EVAL_EVERY: int,
-    eval_funcs: Sequence[callable],
-    eval_kwargs: dict[Any],
+    eval_funcs: Sequence[EvalFunction],
+    eval_kwargs: Sequence[dict[str, Any]],
     save_checkpoints: bool = False,
     checkpoint_filename: str = "checkpoint",
     save_best_checkpoint: bool = False,
-    best_checkpoint_metric: str = "loss"
+    best_checkpoint_metric: str | None = None,
+    metric_mode: Literal["max", "min"] = "max",
 ):
-    results = {}
-    batch_loss = 0
-    best_eval_result = 0.
-
-    step = 0
+    best_eval_result = (float("-inf") if metric_mode == "max" else float("inf"))
     batch_step = 0
-    has_evaluated_this_step = False
-    for n in range(EPOCHS):
-        for batch in tqdm(train_loader):
-            # Evaluation
-            if batch_step % EVAL_EVERY == 0 and not has_evaluated_this_step:
-                model.eval()
-                torch.set_grad_enabled(False)
-                for idx in range(len(eval_funcs)):
-                    eval_results = eval_funcs[idx](**eval_kwargs[idx])
-                    results.update(eval_results)
-                    if save_best_checkpoint:
-                        if results[best_checkpoint_metric] > best_eval_result:
-                            best_eval_result = results[best_checkpoint_metric]
-                            model.save_pretrained(f"{checkpoint_filename}_best")
-                torch.set_grad_enabled(True)
-                model.train()
 
-                has_evaluated_this_step = True
+    def run_evaluation():
+        nonlocal best_eval_result
 
-            # Compute gradients
-            model.train()
+        # All non-main ranks wait while rank 0 performs evaluation.
+        accelerator.wait_for_everyone()
+
+        if accelerator.is_main_process:
+            # Bypass DDP because only rank 0 is evaluating.
+            eval_model = accelerator.unwrap_model(model)
+            eval_model.eval()
+
+            evaluation_results = {}
+
+            with torch.inference_mode():
+                for eval_func, kwargs in zip(eval_funcs, eval_kwargs):
+                    rank_zero_kwargs = dict(kwargs)
+                    rank_zero_kwargs["model"] = eval_model
+                    rank_zero_kwargs["device"] = accelerator.device
+
+                    result = eval_func(**rank_zero_kwargs)
+                    evaluation_results.update(result)
+
+            evaluation_results["trainer/update_step"] = batch_step
+            wandb.log(evaluation_results)
+
+            if save_best_checkpoint:
+                metric = evaluation_results[best_checkpoint_metric]
+
+                is_best = (metric > best_eval_result) if metric_mode == "max" else (metric < best_eval_result)
+
+                if is_best:
+                    best_eval_result = metric
+                    eval_model.save_pretrained(
+                        f"{checkpoint_filename}_best",
+                        safe_serialization=True,
+                    )
+
+        accelerator.wait_for_everyone()
+        model.train()
+
+    run_evaluation()
+    optimizer.zero_grad(set_to_none=True)
+
+    for epoch in range(EPOCHS):
+        progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{EPOCHS}",
+            disable=not accelerator.is_local_main_process,
+        )
+        accumulated_loss = torch.zeros(
+            (),
+            device=accelerator.device,
+            dtype=torch.float32,
+        )
+        accumulated_micro_batches = 0
+
+        for batch in progress:
             input_ids, attn_mask, labels = batch
-            input_ids, attn_mask, labels = input_ids.to(device), attn_mask.to(device), labels.to(device)
 
-            with ctx:
-                out = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
-                loss = out.loss
+            # The prepared dataloader already places tensors on the local GPU.
+            with accelerator.accumulate(model):
+                output = model(
+                    input_ids=input_ids,
+                    attention_mask=attn_mask,
+                    labels=labels,
+                )
+                loss = output.loss
 
-            loss /= GRAD_ACCUM_STEPS
-            loss.backward()
-            batch_loss += loss.item()
+                accumulated_loss += loss.detach().float()
+                accumulated_micro_batches += 1
 
-            # Weight update
-            if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                accelerator.backward(loss)
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
-                results["train/loss"] = batch_loss
-                batch_loss = 0
+                # True only when an optimizer update actually happens.
+                did_update = accelerator.sync_gradients
 
-                batch_step += 1
-                has_evaluated_this_step = False
+            if not did_update:
+                continue
 
-                if results != {}:
-                    wandb.log(results)
-                    results = {}
+            batch_step += 1
+            local_mean_loss = (accumulated_loss / accumulated_micro_batches)
 
-            step += 1
-            torch.cuda.empty_cache()
+            mean_loss = accelerator.reduce(local_mean_loss, reduction="mean").item()
 
-        if save_checkpoints:
-            n_str = str(n).zfill(2)
-            model.save_pretrained(f"{checkpoint_filename}_{n_str}")
+            if accelerator.is_main_process:
+                wandb.log(
+                    {
+                        "train/loss": mean_loss,
+                        "trainer/update_step": batch_step,
+                    }
+                )
+                progress.set_postfix(loss=f"{mean_loss:.4f}")
+
+            accumulated_loss.zero_()
+            accumulated_micro_batches = 0
+
+            if batch_step % EVAL_EVERY == 0:
+                run_evaluation()
